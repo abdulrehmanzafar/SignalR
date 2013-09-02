@@ -48,6 +48,7 @@ namespace Microsoft.AspNet.SignalR.ServiceBus
         }
 
         [SuppressMessage("Microsoft.Reliability", "CA2000:Dispose objects before losing scope", Justification = "The disposable is returned to the caller")]
+        [SuppressMessage("Microsoft.Design", "CA1031:DoNotCatchGeneralExceptionTypes", Justification = "We retry to create the topics on exceptions")]
         public ServiceBusSubscription Subscribe(IList<string> topicNames,
                                                 Action<int, IEnumerable<BrokeredMessage>> handler,
                                                 Action<int, Exception> errorHandler)
@@ -67,13 +68,15 @@ namespace Microsoft.AspNet.SignalR.ServiceBus
             var subscriptions = new ServiceBusSubscription.SubscriptionContext[topicNames.Count];
             var clients = new TopicClient[topicNames.Count];
 
+            var connectionContext = new ServiceBusConnectionContext(subscriptions, clients, topicNames, handler, errorHandler);
+
             for (var topicIndex = 0; topicIndex < topicNames.Count; ++topicIndex)
             {
                 while (true)
                 {
                     try
                     {
-                        CreateTopic(new ServiceBusConnectionContext(subscriptions, clients, topicNames, handler, errorHandler), topicIndex);
+                        CreateTopic(connectionContext, topicIndex);
                         break;
                     }
                     catch (UnauthorizedAccessException ex)
@@ -112,6 +115,7 @@ namespace Microsoft.AspNet.SignalR.ServiceBus
             return new ServiceBusSubscription(_configuration, _namespaceManager, subscriptions, clients);
         }
 
+        [SuppressMessage("Microsoft.Design", "CA1031:DoNotCatchGeneralExceptionTypes", Justification = "We retry to create the topic on exceptions")]
         private void CreateTopicWithRetry(ServiceBusConnectionContext connectionContext, int topicIndex)
         {
             try
@@ -173,7 +177,7 @@ namespace Microsoft.AspNet.SignalR.ServiceBus
             }
 
             // Create a client for this topic
-            connectionContext.TopicCLients[topicIndex] = TopicClient.CreateFromConnectionString(_configuration.ConnectionString, topicName);
+            connectionContext.TopicClients[topicIndex] = TopicClient.CreateFromConnectionString(_configuration.ConnectionString, topicName);
 
             _trace.TraceInformation("Creation of a new topic client {0} completed successfully.", topicName);
 
@@ -304,7 +308,7 @@ namespace Microsoft.AspNet.SignalR.ServiceBus
                 shouldContinue = false;
             }
             catch (OperationCanceledException)
-            {               
+            {
                 // This means the channel is closed
                 _trace.TraceError("Receiving messages from the service bus threw an OperationCanceledException, most likely due to a closed channel.");
 
@@ -313,8 +317,7 @@ namespace Microsoft.AspNet.SignalR.ServiceBus
             catch (MessagingEntityNotFoundException)
             {
                 receiverContext.Receiver.Close();
-                CreateTopicWithRetry(receiverContext.ConnectionContext, receiverContext.TopicIndex);
-
+                TaskAsyncHelper.Delay(RetryDelay).Then(ctx => CreateTopicWithRetry(receiverContext.ConnectionContext, receiverContext.TopicIndex), receiverContext);
                 return false;
             }
             catch (Exception ex)
@@ -376,7 +379,7 @@ namespace Microsoft.AspNet.SignalR.ServiceBus
         private class ServiceBusConnectionContext
         {
             public readonly ServiceBusSubscription.SubscriptionContext[] Subscriptions;
-            public readonly TopicClient[] TopicCLients;
+            public readonly TopicClient[] TopicClients;
 
             public readonly IList<string> TopicNames;
             public readonly Action<int, IEnumerable<BrokeredMessage>> Handler;
@@ -385,7 +388,7 @@ namespace Microsoft.AspNet.SignalR.ServiceBus
             public ServiceBusConnectionContext(ServiceBusSubscription.SubscriptionContext[] subscriptions, TopicClient[] topicClients, IList<string> topicNames, Action<int, IEnumerable<BrokeredMessage>> handler, Action<int, Exception> errorHandler)
             {
                 Subscriptions = subscriptions;
-                TopicCLients = topicClients;
+                TopicClients = topicClients;
                 TopicNames = topicNames;
                 Handler = handler;
                 ErrorHandler = errorHandler;
