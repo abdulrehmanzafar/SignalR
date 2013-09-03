@@ -115,46 +115,6 @@ namespace Microsoft.AspNet.SignalR.ServiceBus
             return new ServiceBusSubscription(_configuration, _namespaceManager, subscriptions, clients);
         }
 
-        [SuppressMessage("Microsoft.Design", "CA1031:DoNotCatchGeneralExceptionTypes", Justification = "We retry to create the topic on exceptions")]
-        private void CreateTopicWithRetry(ServiceBusConnectionContext connectionContext, int topicIndex)
-        {
-            try
-            {
-                while (true)
-                {
-                    CreateTopic(connectionContext, topicIndex);
-                    break;
-                }
-            }
-            catch (UnauthorizedAccessException ex)
-            {
-                _trace.TraceError("Failed to create service bus topic : {0}", ex.Message);
-                throw;
-            }
-            catch (QuotaExceededException ex)
-            {
-                _trace.TraceError("Failed to create service bus topic : {0}", ex.Message);
-                throw;
-            }
-            catch (MessagingException ex)
-            {
-                _trace.TraceError("Failed to create service bus topic : {0}", ex.Message);
-                if (ex.IsTransient)
-                {
-                    Thread.Sleep(RetryDelay);
-                }
-                else
-                {
-                    throw;
-                }
-            }
-            catch (Exception ex)
-            {
-                _trace.TraceError("Failed to create service bus topic : {0}", ex.Message);
-                Thread.Sleep(RetryDelay);
-            }
-        }
-
         private void CreateTopic(ServiceBusConnectionContext connectionContext, int topicIndex)
         {
             string topicName = connectionContext.TopicNames[topicIndex];
@@ -220,6 +180,45 @@ namespace Microsoft.AspNet.SignalR.ServiceBus
             var receiverContext = new ReceiverContext(topicIndex, receiver, connectionContext);
 
             ProcessMessages(receiverContext);
+        }
+
+        private void Retry(Action action)
+        {
+            while (true)
+            {
+                try
+                {
+                    action();
+                    break;
+                }
+                catch (UnauthorizedAccessException ex)
+                {
+                    _trace.TraceError("Failed to create service bus topic : {0}", ex.Message);
+                    throw;
+                }
+                catch (QuotaExceededException ex)
+                {
+                    _trace.TraceError("Failed to create service bus topic : {0}", ex.Message);
+                    throw;
+                }
+                catch (MessagingException ex)
+                {
+                    _trace.TraceError("Failed to create service bus topic : {0}", ex.Message);
+                    if (ex.IsTransient)
+                    {
+                        Thread.Sleep(RetryDelay);
+                    }
+                    else
+                    {
+                        throw;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _trace.TraceError("Failed to create service bus topic : {0}", ex.Message);
+                    Thread.Sleep(RetryDelay);
+                }
+            }
         }
 
         protected virtual void Dispose(bool disposing)
@@ -316,8 +315,8 @@ namespace Microsoft.AspNet.SignalR.ServiceBus
             }
             catch (MessagingEntityNotFoundException)
             {
-                receiverContext.Receiver.Close();
-                TaskAsyncHelper.Delay(RetryDelay).Then(ctx => CreateTopicWithRetry(receiverContext.ConnectionContext, receiverContext.TopicIndex), receiverContext);
+                receiverContext.Receiver.CloseAsync();
+                TaskAsyncHelper.Delay(RetryDelay).Then(() => Retry(() => CreateSubscription(receiverContext.ConnectionContext, receiverContext.TopicIndex)));
                 return false;
             }
             catch (Exception ex)
