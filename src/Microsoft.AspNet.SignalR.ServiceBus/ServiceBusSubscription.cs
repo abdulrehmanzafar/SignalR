@@ -42,14 +42,25 @@ namespace Microsoft.AspNet.SignalR.ServiceBus
         {
             if (disposing)
             {
-                for (int i = 0; i < _clients.Count; i++)
+                // Disposing separately to avoid getting a lock on _clients and Subscriptions together
+
+                lock (_clients)
                 {
-                    var subscription = Subscriptions[i];
-                    subscription.Receiver.Close();
+                    for (int i = 0; i < _clients.Count; i++)
+                    {
+                        _clients[i].Close();
+                    }
+                }
 
-                    _clients[i].Close();
+                lock (Subscriptions)
+                {
+                    for (int i = 0; i < Subscriptions.Count; i++)
+                    {
+                        var subscription = Subscriptions[i];
+                        subscription.Receiver.Close();
+                        _namespaceManager.DeleteSubscription(subscription.TopicPath, subscription.Name);
 
-                    _namespaceManager.DeleteSubscription(subscription.TopicPath, subscription.Name);
+                    }
                 }
             }
         }

@@ -27,6 +27,8 @@ namespace Microsoft.AspNet.SignalR.ServiceBus
         private readonly ServiceBusScaleoutConfiguration _configuration;
         private readonly TraceSource _trace;
 
+        private bool _disposed;
+
         public ServiceBusConnection(ServiceBusScaleoutConfiguration configuration, TraceSource traceSource)
         {
             _trace = traceSource;
@@ -65,121 +67,98 @@ namespace Microsoft.AspNet.SignalR.ServiceBus
 
             _trace.TraceInformation("Subscribing to {0} topic(s) in the service bus...", topicNames.Count);
 
-            var subscriptions = new ServiceBusSubscription.SubscriptionContext[topicNames.Count];
-            var clients = new TopicClient[topicNames.Count];
-
-            var connectionContext = new ServiceBusConnectionContext(subscriptions, clients, topicNames, handler, errorHandler);
+            var connectionContext = new ServiceBusConnectionContext(topicNames, handler, errorHandler);
 
             for (var topicIndex = 0; topicIndex < topicNames.Count; ++topicIndex)
             {
-                while (true)
-                {
-                    try
-                    {
-                        CreateTopic(connectionContext, topicIndex);
-                        break;
-                    }
-                    catch (UnauthorizedAccessException ex)
-                    {
-                        _trace.TraceError("Failed to create service bus topic : {0}", ex.Message);
-                        throw;
-                    }
-                    catch (QuotaExceededException ex)
-                    {
-                        _trace.TraceError("Failed to create service bus topic : {0}", ex.Message);
-                        throw;
-                    }
-                    catch (MessagingException ex)
-                    {
-                        _trace.TraceError("Failed to create service bus topic : {0}", ex.Message);
-                        if (ex.IsTransient)
-                        {
-                            Thread.Sleep(RetryDelay);
-                        }
-                        else
-                        {
-                            throw;
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        _trace.TraceError("Failed to initialize service bus : {0}", ex.Message);
-
-                        Thread.Sleep(RetryDelay);
-                    }
-                }
+                Retry(() => CreateTopic(connectionContext, topicIndex));
             }
 
             _trace.TraceInformation("Subscription to {0} topics in the service bus Topic service completed successfully.", topicNames.Count);
 
-            return new ServiceBusSubscription(_configuration, _namespaceManager, subscriptions, clients);
+            return new ServiceBusSubscription(_configuration, _namespaceManager, connectionContext.Subscriptions, connectionContext.TopicClients);
         }
 
         private void CreateTopic(ServiceBusConnectionContext connectionContext, int topicIndex)
         {
-            string topicName = connectionContext.TopicNames[topicIndex];
-
-            if (!_namespaceManager.TopicExists(topicName))
+            lock (connectionContext.TopicClients)
             {
-                try
+                if (_disposed)
                 {
-                    _trace.TraceInformation("Creating a new topic {0} in the service bus...", topicName);
-
-                    _namespaceManager.CreateTopic(topicName);
-
-                    _trace.TraceInformation("Creation of a new topic {0} in the service bus completed successfully.", topicName);
+                    return;
                 }
-                catch (MessagingEntityAlreadyExistsException)
+
+                string topicName = connectionContext.TopicNames[topicIndex];
+
+                if (!_namespaceManager.TopicExists(topicName))
                 {
-                    // The entity already exists
-                    _trace.TraceInformation("Creation of a new topic {0} threw an MessagingEntityAlreadyExistsException.", topicName);
+                    try
+                    {
+                        _trace.TraceInformation("Creating a new topic {0} in the service bus...", topicName);
+
+                        _namespaceManager.CreateTopic(topicName);
+
+                        _trace.TraceInformation("Creation of a new topic {0} in the service bus completed successfully.", topicName);
+                    }
+                    catch (MessagingEntityAlreadyExistsException)
+                    {
+                        // The entity already exists
+                        _trace.TraceInformation("Creation of a new topic {0} threw an MessagingEntityAlreadyExistsException.", topicName);
+                    }
                 }
+
+                // Create a client for this topic
+                connectionContext.UpdateTopicClients(TopicClient.CreateFromConnectionString(_configuration.ConnectionString, topicName), topicIndex, _disposed);
+
+                _trace.TraceInformation("Creation of a new topic client {0} completed successfully.", topicName);
+
+                CreateSubscription(connectionContext, topicIndex);
             }
-
-            // Create a client for this topic
-            connectionContext.TopicClients[topicIndex] = TopicClient.CreateFromConnectionString(_configuration.ConnectionString, topicName);
-
-            _trace.TraceInformation("Creation of a new topic client {0} completed successfully.", topicName);
-
-            CreateSubscription(connectionContext, topicIndex);
         }
 
         private void CreateSubscription(ServiceBusConnectionContext connectionContext, int topicIndex)
         {
-            string topicName = connectionContext.TopicNames[topicIndex];
-
-            // Create a random subscription
-            string subscriptionName = Guid.NewGuid().ToString();
-
-            try
+            lock (connectionContext.Subscriptions)
             {
-                var subscriptionDescription = new SubscriptionDescription(topicName, subscriptionName);
+                if (_disposed)
+                {
+                    return;
+                }
 
-                // This cleans up the subscription while if it's been idle for more than the timeout.
-                subscriptionDescription.AutoDeleteOnIdle = IdleSubscriptionTimeout;
+                string topicName = connectionContext.TopicNames[topicIndex];
 
-                _namespaceManager.CreateSubscription(subscriptionDescription);
+                // Create a random subscription
+                string subscriptionName = Guid.NewGuid().ToString();
 
-                _trace.TraceInformation("Creation of a new subscription {0} for topic {1} in the service bus completed successfully.", subscriptionName, topicName);
+                try
+                {
+                    var subscriptionDescription = new SubscriptionDescription(topicName, subscriptionName);
+
+                    // This cleans up the subscription while if it's been idle for more than the timeout.
+                    subscriptionDescription.AutoDeleteOnIdle = IdleSubscriptionTimeout;
+
+                    _namespaceManager.CreateSubscription(subscriptionDescription);
+
+                    _trace.TraceInformation("Creation of a new subscription {0} for topic {1} in the service bus completed successfully.", subscriptionName, topicName);
+                }
+                catch (MessagingEntityAlreadyExistsException)
+                {
+                    // The entity already exists
+                    _trace.TraceInformation("Creation of a new subscription {0} for topic {1} threw an MessagingEntityAlreadyExistsException.", subscriptionName, topicName);
+                }
+
+                // Create a receiver to get messages
+                string subscriptionEntityPath = SubscriptionClient.FormatSubscriptionPath(topicName, subscriptionName);
+                MessageReceiver receiver = _factory.CreateMessageReceiver(subscriptionEntityPath, ReceiveMode.ReceiveAndDelete);
+
+                _trace.TraceInformation("Creation of a message receive for subscription entity path {0} in the service bus completed successfully.", subscriptionEntityPath);
+
+                connectionContext.UpdateSubscriptionContext(new ServiceBusSubscription.SubscriptionContext(topicName, subscriptionName, receiver), topicIndex, _disposed);
+
+                var receiverContext = new ReceiverContext(topicIndex, receiver, connectionContext);
+
+                ProcessMessages(receiverContext);
             }
-            catch (MessagingEntityAlreadyExistsException)
-            {
-                // The entity already exists
-                _trace.TraceInformation("Creation of a new subscription {0} for topic {1} threw an MessagingEntityAlreadyExistsException.", subscriptionName, topicName);
-            }
-
-            // Create a receiver to get messages
-            string subscriptionEntityPath = SubscriptionClient.FormatSubscriptionPath(topicName, subscriptionName);
-            MessageReceiver receiver = _factory.CreateMessageReceiver(subscriptionEntityPath, ReceiveMode.ReceiveAndDelete);
-
-            _trace.TraceInformation("Creation of a message receive for subscription entity path {0} in the service bus completed successfully.", subscriptionEntityPath);
-
-
-            connectionContext.Subscriptions[topicIndex] = new ServiceBusSubscription.SubscriptionContext(topicName, subscriptionName, receiver);
-
-            var receiverContext = new ReceiverContext(topicIndex, receiver, connectionContext);
-
-            ProcessMessages(receiverContext);
         }
 
         private void Retry(Action action)
@@ -193,17 +172,17 @@ namespace Microsoft.AspNet.SignalR.ServiceBus
                 }
                 catch (UnauthorizedAccessException ex)
                 {
-                    _trace.TraceError("Failed to create service bus topic : {0}", ex.Message);
+                    _trace.TraceError("Failed to create service bus subscription or topic : {0}", ex.Message);
                     throw;
                 }
                 catch (QuotaExceededException ex)
                 {
-                    _trace.TraceError("Failed to create service bus topic : {0}", ex.Message);
+                    _trace.TraceError("Failed to create service bus subscription or topic : {0}", ex.Message);
                     throw;
                 }
                 catch (MessagingException ex)
                 {
-                    _trace.TraceError("Failed to create service bus topic : {0}", ex.Message);
+                    _trace.TraceError("Failed to create service bus subscription or topic : {0}", ex.Message);
                     if (ex.IsTransient)
                     {
                         Thread.Sleep(RetryDelay);
@@ -215,7 +194,7 @@ namespace Microsoft.AspNet.SignalR.ServiceBus
                 }
                 catch (Exception ex)
                 {
-                    _trace.TraceError("Failed to create service bus topic : {0}", ex.Message);
+                    _trace.TraceError("Failed to create service bus subscription or topic : {0}", ex.Message);
                     Thread.Sleep(RetryDelay);
                 }
             }
@@ -225,8 +204,12 @@ namespace Microsoft.AspNet.SignalR.ServiceBus
         {
             if (disposing)
             {
-                // Close the factory
-                _factory.Close();
+                lock (disposed)
+                {
+                    // Close the factory
+                    _factory.Close();
+                    disposed = true;
+                }
             }
         }
 
@@ -316,7 +299,7 @@ namespace Microsoft.AspNet.SignalR.ServiceBus
             catch (MessagingEntityNotFoundException)
             {
                 receiverContext.Receiver.CloseAsync();
-                TaskAsyncHelper.Delay(RetryDelay).Then(() => Retry(() => CreateSubscription(receiverContext.ConnectionContext, receiverContext.TopicIndex)));
+                //TaskAsyncHelper.Delay(RetryDelay).Then<ReceiverContext>((recvCtx) => Retry((ctx) => CreateSubscription(ctx.ConnectionContext, ctx.TopicIndex), recvCtx), receiverContext);
                 return false;
             }
             catch (Exception ex)
@@ -375,22 +358,44 @@ namespace Microsoft.AspNet.SignalR.ServiceBus
             }
         }
 
-        private class ServiceBusConnectionContext
+        private class ServiceBusConnectionContext : IDisposable
         {
-            public readonly ServiceBusSubscription.SubscriptionContext[] Subscriptions;
-            public readonly TopicClient[] TopicClients;
+            internal readonly ServiceBusSubscription.SubscriptionContext[] Subscriptions;
+            internal readonly TopicClient[] TopicClients;
 
             public readonly IList<string> TopicNames;
             public readonly Action<int, IEnumerable<BrokeredMessage>> Handler;
             public readonly Action<int, Exception> ErrorHandler;
 
-            public ServiceBusConnectionContext(ServiceBusSubscription.SubscriptionContext[] subscriptions, TopicClient[] topicClients, IList<string> topicNames, Action<int, IEnumerable<BrokeredMessage>> handler, Action<int, Exception> errorHandler)
+            public ServiceBusConnectionContext(IList<string> topicNames, Action<int, IEnumerable<BrokeredMessage>> handler, Action<int, Exception> errorHandler)
             {
-                Subscriptions = subscriptions;
-                TopicClients = topicClients;
+                Subscriptions = new ServiceBusSubscription.SubscriptionContext[topicNames.Count];
+                TopicClients = new TopicClient[topicNames.Count];
                 TopicNames = topicNames;
                 Handler = handler;
                 ErrorHandler = errorHandler;
+            }
+
+            public void UpdateSubscriptionContext(ServiceBusSubscription.SubscriptionContext subscriptionContext, int topicIndex, bool disposed)
+            {
+                lock (Subscriptions)
+                {
+                    if (!disposed)
+                    {
+                        Subscriptions[topicIndex] = subscriptionContext;
+                    }
+                }
+            }
+
+            public void UpdateTopicClients(TopicClient topicClient, int topicIndex, bool disposed)
+            {
+                lock (TopicClients)
+                {
+                    if (!disposed)
+                    {
+                        TopicClients[topicIndex] = topicClient;
+                    }
+                }
             }
         }
     }
