@@ -27,8 +27,6 @@ namespace Microsoft.AspNet.SignalR.ServiceBus
         private readonly ServiceBusScaleoutConfiguration _configuration;
         private readonly TraceSource _trace;
 
-        private bool _disposed;
-
         public ServiceBusConnection(ServiceBusScaleoutConfiguration configuration, TraceSource traceSource)
         {
             _trace = traceSource;
@@ -51,7 +49,7 @@ namespace Microsoft.AspNet.SignalR.ServiceBus
 
         [SuppressMessage("Microsoft.Reliability", "CA2000:Dispose objects before losing scope", Justification = "The disposable is returned to the caller")]
         [SuppressMessage("Microsoft.Design", "CA1031:DoNotCatchGeneralExceptionTypes", Justification = "We retry to create the topics on exceptions")]
-        public ServiceBusSubscription Subscribe(IList<string> topicNames,
+        public ServiceBusConnectionContext Subscribe(IList<string> topicNames,
                                                 Action<int, IEnumerable<BrokeredMessage>> handler,
                                                 Action<int, Exception> errorHandler)
         {
@@ -67,7 +65,7 @@ namespace Microsoft.AspNet.SignalR.ServiceBus
 
             _trace.TraceInformation("Subscribing to {0} topic(s) in the service bus...", topicNames.Count);
 
-            var connectionContext = new ServiceBusConnectionContext(topicNames, handler, errorHandler);
+            var connectionContext = new ServiceBusConnectionContext(_configuration, _namespaceManager, topicNames, handler, errorHandler);
 
             for (var topicIndex = 0; topicIndex < topicNames.Count; ++topicIndex)
             {
@@ -76,14 +74,14 @@ namespace Microsoft.AspNet.SignalR.ServiceBus
 
             _trace.TraceInformation("Subscription to {0} topics in the service bus Topic service completed successfully.", topicNames.Count);
 
-            return new ServiceBusSubscription(_configuration, _namespaceManager, connectionContext.Subscriptions, connectionContext.TopicClients);
+            return connectionContext;
         }
 
         private void CreateTopic(ServiceBusConnectionContext connectionContext, int topicIndex)
         {
-            lock (connectionContext.TopicClients)
+            lock (connectionContext.TopicClientsLock)
             {
-                if (_disposed)
+                if (connectionContext.IsConnectionContextDisposed)
                 {
                     return;
                 }
@@ -108,19 +106,19 @@ namespace Microsoft.AspNet.SignalR.ServiceBus
                 }
 
                 // Create a client for this topic
-                connectionContext.UpdateTopicClients(TopicClient.CreateFromConnectionString(_configuration.ConnectionString, topicName), topicIndex, _disposed);
+                connectionContext.UpdateTopicClients(TopicClient.CreateFromConnectionString(_configuration.ConnectionString, topicName), topicIndex);
 
                 _trace.TraceInformation("Creation of a new topic client {0} completed successfully.", topicName);
-
-                CreateSubscription(connectionContext, topicIndex);
             }
+
+            CreateSubscription(connectionContext, topicIndex);
         }
 
         private void CreateSubscription(ServiceBusConnectionContext connectionContext, int topicIndex)
         {
-            lock (connectionContext.Subscriptions)
+            lock (connectionContext.SubscriptionsLock)
             {
-                if (_disposed)
+                if (connectionContext.IsConnectionContextDisposed)
                 {
                     return;
                 }
@@ -153,7 +151,7 @@ namespace Microsoft.AspNet.SignalR.ServiceBus
 
                 _trace.TraceInformation("Creation of a message receive for subscription entity path {0} in the service bus completed successfully.", subscriptionEntityPath);
 
-                connectionContext.UpdateSubscriptionContext(new ServiceBusSubscription.SubscriptionContext(topicName, subscriptionName, receiver), topicIndex, _disposed);
+                connectionContext.UpdateSubscriptionContext(new SubscriptionContext(topicName, subscriptionName, receiver), topicIndex);
 
                 var receiverContext = new ReceiverContext(topicIndex, receiver, connectionContext);
 
@@ -204,12 +202,8 @@ namespace Microsoft.AspNet.SignalR.ServiceBus
         {
             if (disposing)
             {
-                lock (disposed)
-                {
-                    // Close the factory
-                    _factory.Close();
-                    disposed = true;
-                }
+                // Close the factory
+                _factory.Close();
             }
         }
 
@@ -299,7 +293,7 @@ namespace Microsoft.AspNet.SignalR.ServiceBus
             catch (MessagingEntityNotFoundException)
             {
                 receiverContext.Receiver.CloseAsync();
-                //TaskAsyncHelper.Delay(RetryDelay).Then<ReceiverContext>((recvCtx) => Retry((ctx) => CreateSubscription(ctx.ConnectionContext, ctx.TopicIndex), recvCtx), receiverContext);
+                TaskAsyncHelper.Delay(RetryDelay).Then(() => Retry(() => CreateSubscription(receiverContext.ConnectionContext, receiverContext.TopicIndex)));
                 return false;
             }
             catch (Exception ex)
@@ -358,45 +352,6 @@ namespace Microsoft.AspNet.SignalR.ServiceBus
             }
         }
 
-        private class ServiceBusConnectionContext : IDisposable
-        {
-            internal readonly ServiceBusSubscription.SubscriptionContext[] Subscriptions;
-            internal readonly TopicClient[] TopicClients;
 
-            public readonly IList<string> TopicNames;
-            public readonly Action<int, IEnumerable<BrokeredMessage>> Handler;
-            public readonly Action<int, Exception> ErrorHandler;
-
-            public ServiceBusConnectionContext(IList<string> topicNames, Action<int, IEnumerable<BrokeredMessage>> handler, Action<int, Exception> errorHandler)
-            {
-                Subscriptions = new ServiceBusSubscription.SubscriptionContext[topicNames.Count];
-                TopicClients = new TopicClient[topicNames.Count];
-                TopicNames = topicNames;
-                Handler = handler;
-                ErrorHandler = errorHandler;
-            }
-
-            public void UpdateSubscriptionContext(ServiceBusSubscription.SubscriptionContext subscriptionContext, int topicIndex, bool disposed)
-            {
-                lock (Subscriptions)
-                {
-                    if (!disposed)
-                    {
-                        Subscriptions[topicIndex] = subscriptionContext;
-                    }
-                }
-            }
-
-            public void UpdateTopicClients(TopicClient topicClient, int topicIndex, bool disposed)
-            {
-                lock (TopicClients)
-                {
-                    if (!disposed)
-                    {
-                        TopicClients[topicIndex] = topicClient;
-                    }
-                }
-            }
-        }
     }
 }
